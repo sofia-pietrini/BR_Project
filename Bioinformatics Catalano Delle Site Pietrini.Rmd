@@ -1,0 +1,928 @@
+---
+title: "Bioinformacts Project Thyroid Carcinoma"
+date: "23/07/2025"
+author: "Alberto Catalano, Alessandro Delle Site, Sofia Pietrini"
+output:
+  html_document:
+    code_folding: hide
+    toc: true              
+    toc_float: true        
+    number_sections: true  
+    theme: flatly          
+    highlight: tango
+geometry: left=2cm,right=2cm,top=1cm,bottom=1.5cm
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning=FALSE,
+message=FALSE,
+tidy.opts=list(width.cutoff = 80),
+tidy = TRUE)
+knitr::opts_chunk$set(comment = NA)
+```
+
+\hrule
+
+```{r}
+# Core Bioconductor packages for annotation, analysis, and genomics
+library(STRINGdb)
+library(pathview)
+library(biomaRt)
+library(edgeR)
+library(fgsea)
+library(genefilter)
+library(Biobase)
+library(GenomicFeatures)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(MotifDb)
+library(seqLogo)
+library(PWMEnrich)
+library(PWMEnrich.Hsapiens.background)
+library(TxDb.Hsapiens.UCSC.hg38.knownGene)
+library(BSgenome.Hsapiens.UCSC.hg38)
+library(enrichplot)
+library(msigdbr)
+
+# Visualization 
+library(pheatmap)
+library(dendextend)
+library(plotly) #3D PCA!
+library(RColorBrewer)
+
+#Data manipulation and graph/network analysis
+library(igraph)
+library(stringr)
+library(tidyverse)
+
+```
+
+# Introduction
+
+In this project we analyzed the RNA-seq count dataset "Thyroid_carcinoma.RData", derived from The Cancer Genome Atlas (TCGA), which includes gene expression data from thyroid cancer and corresponding normal tissue samples.
+It represents approximately 95% of all endocrine tumors, accounting for roughly 2.5% of all malignancies [2].     
+Its incidence, particularly of papillary thyroid carcinoma (PTC), has doubled in the past three decades and continues to increase at an annual rate of approximately 5%, which poses significant threats to human health [3].   
+    
+To investigate the molecular characteristics of thyroid carcinoma, we performed a comprehensive analysis that included Differential Expression Analysis, Gene Set Enrichment Analysis (GSEA), and motif analysis to identify key transcription factors (TFs). Additionally, we constructed a Protein-Protein Interaction (PPI) network and conducted network analysis to explore potential functional relationships among differentially expressed genes. These steps provided insight into the underlying biological pathways and regulatory mechanisms associated with thyroid cancer.
+
+# Data pre-processing
+
+## Data Loading and filtering 
+
+As the first step of the analysis, the dataset was loaded.
+
+```{r, results='hide'}
+#setwd("path/to/file")
+load("Thyroid_carcinoma.RData")
+```
+
+immediately after it was filtered to retain only protein-coding genes, which are typically the most biologically relevant for studying gene expression changes in cancer.   
+
+Using the biomaRt package, gene annotation information, which includes Ensembl gene ID, external gene name, and gene biotype, was retrieved from the Ensembl database for all genes present in the dataset.   
+The resulting annotation table included 62,020 genes, of which 22,152 were identified as protein-coding based on their biotype.    
+The annotation data (r_anno_df) and the raw count matrix (raw_counts_df) were then both subset to include only these protein-coding genes, reducing the dimensionality of the dataset while preserving its biological focus.  
+  
+This refinement ensures that downstream analyses, such as differential expression and pathway enrichment, are performed on genes that are more likely to have functional and regulatory roles in thyroid cancer.
+
+```{r}
+#Connect to the Ensembl BioMart database for human genes 
+ensembl <- useMart(biomart="ensembl",dataset="hsapiens_gene_ensembl") 
+#Create a list of Ensembl gene IDs from the annotation dataframe r_anno_df, to use as a filter in the next step
+filter <- r_anno_df$ensembl_gene_id
+
+#Retrieve a table from Ensembl with 3 columns for each gene
+query <- getBM(attributes = c("ensembl_gene_id",
+                              "external_gene_name",
+                              "gene_biotype"), 
+               filter=c("ensembl_gene_id"),
+               values = list(filter),
+               mar = ensembl)
+
+#Filter to retain only protein coding genes
+query_protein_coding <- query[which(query$gene_biotype=="protein_coding"),]
+
+#Filter the original annotation dataframe r_anno_df to keep only rows corresponding to protein-coding genes
+r_anno_df_pc <- r_anno_df[which(r_anno_df$ensembl_gene_id %in% query_protein_coding$ensembl_gene_id),]
+
+#Filter the RNA-seq count matrix raw_counts_df to retain only protein-coding genes
+raw_counts_df_pc <- raw_counts_df[which(rownames(raw_counts_df) %in% query_protein_coding$ensembl_gene_id),]
+
+```
+
+## Filtering by counts and samples
+
+In addition to the first, a second and more specific filter was applied to the dataset to retain only genes with at least 20 counts in a minimum of 5 samples from either conditions.
+With the two filter the total number of genes was reduced from approximately 22,000 to around 16,000.  
+
+A histogram was plotted to catch the effects of the two-step filtering on the data.
+
+```{r, fig.align='center'}
+# Filtering
+filter_vec <- apply(raw_counts_df_pc, 1, function(y) max(by(y,c_anno_df$condition, function(x) sum(x >= 20))))
+
+raw_counts_filtered <- raw_counts_df_pc[filter_vec >= 5,]
+
+r_anno_filtered <-r_anno_df_pc[rownames(raw_counts_filtered),]
+
+# Histogram plotting
+raw_counts_steps_df <- data.frame(
+  Step = c("Unfiltered", "Protein-coding", "Protein-coding expr ≥20 in ≥5 n"),
+  Genes = c(nrow(raw_counts_df), nrow(raw_counts_df_pc), nrow(raw_counts_filtered))
+)
+raw_counts_steps_df <- raw_counts_steps_df %>%
+  mutate(Percent = round(100 * Genes / Genes[1], 1))
+
+raw_counts_steps_df$Step <- factor(raw_counts_steps_df$Step, levels = c(
+  "Unfiltered",
+  "Protein-coding",
+  "Protein-coding expr ≥20 in ≥5 n"
+))
+ggplot(raw_counts_steps_df, aes(x = Step, y = Genes, fill = Step)) +
+  geom_bar(stat = "identity", width = 0.6) +
+  geom_text(aes(label = paste0(Genes, " (", Percent, "%)")),
+            vjust = -0.5, size = 4) +
+  scale_fill_manual(values = c(
+    "Unfiltered" = "#FFECCC",
+    "Protein-coding" = "#D08C60",
+    "Protein-coding expr ≥20 in ≥5 n" = "#A3B18A"
+  )) +
+  labs(
+    title = "Gene Counts After Stepwise Filtering of Raw Counts",
+    y = "Number of Genes",
+    x = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "none")
+```
+
+## Normalization
+
+A considerable variability in the distribution of sequencing reads across samples was observed with a boxplot of the raw counts, highlighting the necessity of a normalization to ensure that observed gene expression differences reflect true biological variation rather than technical artifacts.
+
+```{r, fig.align='center'}
+# Unormalized boxplot
+raw_counts_df_filtered <- as.data.frame(raw_counts_filtered)
+long_raw_counts_df <- gather(raw_counts_df_filtered, key = "sample", value = "Counts")
+ggplot(data = long_raw_counts_df, aes(x = sample, y = Counts + 1)) + 
+  geom_boxplot(fill = "#ff7f00", alpha = 0.7) +  
+  theme_bw() +
+  scale_y_log10() +  
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 5)
+  ) +
+  labs(
+    y = "Raw Counts (log10 scale)",
+    x = "Sample",
+    title = "Raw Counts Distribution per Sample"
+  )
+```
+
+Using the edgeR package, we created a DGEList object, applied TMM normalization to correct for library size differences, and calculated counts per million (CPM) values, which were log-transformed for improved visualization.
+
+```{r}
+#Create an edgeR DGEList object with: Filtered raw counts, Group labels (case/control), Sample metadata, Gene annotations
+dge <- DGEList(counts = raw_counts_filtered, group = c_anno_df$condition, samples = c_anno_df, genes = r_anno_filtered)
+
+#Normalize the counts using TMM (Trimmed Mean of M-values), which adjusts for library size and RNA composition
+dge_norm <- calcNormFactors(dge, method = "TMM")
+
+cpm_table <- as.data.frame(round(cpm(dge_norm),2))
+
+cpm_table_log <- as.data.frame(round(log10(cpm(dge_norm)+1),2))
+```
+
+The normalized boxplot of the distribution of read counts showed well-aligned medians across samples, 
+
+```{r, fig.align='center'}
+#Normalized plot
+
+long_cpm_df <- gather(cpm_table, key = "sample", value = "CPM")
+ggplot(data = long_cpm_df, aes(x = sample, y = CPM + 1)) +
+  geom_boxplot(fill = "#008080", alpha = 0.7) +  
+  theme_bw() +
+  scale_y_log10() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 5) 
+  ) +
+  labs(
+    y = "CPM (log10 scale)",
+    x = "Sample",
+    title = "CPM Distribution per Sample"
+  )
+```
+
+Further exploratory analysis with unsupervised methods was performed to try to visualize clusters within our samples.
+   
+## Hierarchical Clustering
+
+For the hierarchical clustering, ward.D is the linkage distance that was able to better separate the groups, which is the distance we also used later for the heatmap. The resulting dendrogram was able to distinguish two main clusters, corresponding to the Tumor and Control groups, with only few sample misclassifications.
+
+```{r, fig.align='center'}
+clu_data <- t(scale(t(cpm_table)))  
+dd <- dist(t(clu_data), method = "manhattan")
+hc <- hclust(dd, method = "ward.D") 
+dend <- as.dendrogram(hc)
+condition_colors <- ifelse(c_anno_df$condition == "case", "#FFC857", "#412234")
+labels_colors(dend) <- condition_colors[order.dendrogram(dend)]
+dend <- dend %>% set("labels_cex", 0.3)
+plot(dend, main = "Tumor/Control Dendrogram", xlab = "Samples")
+legend(
+  x = "topright",
+  legend = c("Case", "Control"),
+  pch = 15,
+  col = c("#FFC857", "#412234")
+)
+```
+
+## Principal Component Analysis (3D)
+
+3D principal component analysis was performed as well. An almost clear separation between the two groups can be observed along PC2 and PC3.
+
+```{r, fig.align='center'}
+data.matrix <- cpm_table
+data.PC <- prcomp(t(data.matrix), scale. = TRUE)
+
+pca_df <- data.frame(
+  PC1 = data.PC$x[, 1],
+  PC2 = data.PC$x[, 2],
+  PC3 = data.PC$x[, 3],
+  Condition = c_anno_df$condition,
+  Sample = rownames(c_anno_df)
+)
+
+explained_var <- round(100 * summary(data.PC)$importance[2, 1:3], 1)
+
+plot_ly(
+  data = pca_df,
+  x = ~PC1,
+  y = ~PC2,
+  z = ~PC3,
+  color = ~Condition,
+  colors = c("control" = "#412234", "case" = "#FFC857"),
+  text = ~Sample,
+  type = "scatter3d",
+  mode = "markers",
+  marker = list(size = 5, opacity = 0.8)
+) %>%
+  layout(
+    title = "3D PCA",
+    scene = list(
+      xaxis = list(title = paste0("PC1 (", explained_var[1], "%)")),
+      yaxis = list(title = paste0("PC2 (", explained_var[2], "%)")),
+      zaxis = list(title = paste0("PC3 (", explained_var[3], "%)"))
+    ),
+    legend = list(title = list(text = 'Condition'))
+  )
+```
+
+# DEG Analysis
+
+In this section, differential gene expression analysis was performed to identify genes that are significantly upregulated or downregulated in thyroid carcinoma compared to normal tissue. 
+  
+Differential expression testing was then performed using the Quasi-Likelihood F-test implemented in edgeR, which is more robust to outliers.
+
+```{r}
+#Build a design matrix for the linear model, treating case/control as separate groups
+design_matrix <- model.matrix(~0+group, data=dge_norm$samples)
+colnames(design_matrix) <- levels(dge_norm$samples$group)
+rownames(design_matrix) <- dge_norm$samples$sample
+
+#Estimate dispersion
+dge_dispersion <- estimateDisp(dge_norm, design_matrix)
+#Fit a Quasi-Likelihood negative binomial model
+dge_fit <- glmQLFit(dge_dispersion,design_matrix) 
+
+#Define the contrast (case vs control) and perform the Quasi-Likelihood F-test to find differentially expressed genes
+contr <- makeContrasts("case-control", levels=design_matrix)
+dge_glm <- glmQLFTest(dge_fit,contrast=contr)
+```
+
+Based on the given thresholds (FDR < 0.05, log2 fold change > 1.5 or < –1.5, and logCPM > 1), genes were classified and annotated based on their differential expression between normal and tumor samples.   
+
+244 genes were classified as downregulated, 628 as upregulated and 15879 as not differentially expressed. 
+
+
+```{r}
+# Extract all genes tested with adjusted p-value < 0.05 (Benjamini-Hochberg correction applied by default), sorted by logFC
+DEGs <- as.data.frame(topTags(dge_glm, n = nrow(dge_glm$table), sort.by = 'logFC')) 
+
+#Define different classes of genes expression and use a log2 fold change cutoff of ±1.5 and logCPM > 1 as a biological significance filter
+DEGs$class <- "="
+DEGs$class[which(DEGs$logCPM>1 & DEGs$logFC>1.5 & DEGs$FDR<0.05)] = "+" #triple filter
+DEGs$class[which(DEGs$logCPM>1 & DEGs$logFC<(-1.5) & DEGs$FDR<0.05)] = "-" # triple filter
+DEGs <- DEGs[order(DEGs$logFC,decreasing = T),] #logFC sorting
+
+table(DEGs$class)
+```
+## MA Plot
+
+A MA plot displaying log2 CPM in the x-axis vs log2 Fold Change between tumor and control group in the y-axis was plotted, where each point represents a gene.    
+No systematic biases are observed as the distribution of the values is around logFC = 0. Upregulated DEGs are coloured in red, while downregulated in blue and genes with not significantly different expression in grey.  
+
+```{r, fig.align='center'}
+xlabel <- "log2 CPM (Average Expression)"
+ylabel <- "log2 Fold Change (Tumor vs Control)"
+DEGs$color <- ifelse(DEGs$class == "=", "grey",
+                     ifelse(DEGs$class == "-", "blue",
+                            ifelse(DEGs$class == "+", "red", "black")))
+plot(DEGs$logCPM, DEGs$logFC,
+     col = DEGs$color,
+     pch = 20,
+     cex = 0.8,
+     xlab = xlabel,
+     ylab = ylabel,
+     main = "MA Plot (Threshold: log2FC ±1.5)")
+abline(h = 1.5, lty = 2, col = "black")
+abline(h = -1.5, lty = 2, col = "black")
+abline(v = 1, lty = 2, col = "black")
+legend("topright",
+       legend = c("Up-regulated", "Down-regulated", "Not significant"),
+       col = c("red", "blue", "grey"),
+       pch = 20,
+       cex = 0.9,
+       bty = "n")
+```
+
+## Volcano Plot
+
+A volcano plot provided a visualization of the differential expression analysis, showing log2 Fold Change versus -log10 p-value.  
+
+```{r, fig.align='center'}
+xlabel <- "log2 FC Tyroid Carcinoma vs Control"
+ylabel <- "-log10 p-value"
+DEGs$color <- ifelse(DEGs$class == "=", "grey",
+                     ifelse(DEGs$class == "-", "blue",
+                            ifelse(DEGs$class == "+", "red", "black")))
+plot(DEGs$logFC, -log(DEGs$PValue, base=10),
+     xlab = xlabel,
+     ylab = ylabel,
+     col = DEGs$color,
+     pch = 20,
+     frame.plot = TRUE,
+     cex = 0.8,
+     main = "Volcano plot")
+legend("topright",
+       legend = c("Up-regulated", "Down-regulated", "Not significant"),
+       col = c("red", "blue", "grey"),
+       pch = 20,
+       cex = 0.9,
+       bty = "n") 
+abline(v = -1.5, lty = 2, col = "black")
+abline(v = 1.5, lty = 2, col = "black")
+```
+
+## Heatmap
+
+Finally, we produced a heatmap of the differentially expressed genes using log10-transformed CPM values to enhance readability and contrast, allowing clear visualization of expression patterns across samples.
+
+```{r, echo=F, fig.align='center'}
+sig_genes <- DEGs$ensembl_gene_id[DEGs$class %in% c("+", "-")]
+cpm_degs <- as.matrix(cpm_table[rownames(cpm_table) %in% sig_genes, ])
+sample_groups <- factor(c_anno_df$condition, levels = c("case", "control"))
+annotation_df <- data.frame(Group = sample_groups)
+rownames(annotation_df) <- colnames(cpm_degs) 
+ann_colors <- list(
+  Group = c(case = "#FFC857", control = "#412234")
+)
+heatmap_palette <- colorRampPalette(rev(brewer.pal(n = 11, name = "RdBu")))(100)
+pheatmap(
+  cpm_degs,
+  color = heatmap_palette,
+  scale = "row",
+  annotation_col = annotation_df,
+  annotation_colors = ann_colors,
+  clustering_distance_rows = "manhattan",
+  clustering_method = "ward.D",
+  show_rownames = (nrow(cpm_degs) <= 50),
+  fontsize_row = 4,
+  fontsize_col = 6,
+  main = "DEG Expression Heatmap\n(Tumor vs Control)"
+)
+```
+
+# GSEA
+
+Gene Set Enrichment Analysis was performed separately on C4 and C6 gene set collections from MSigDB.   
+C4 is a Computational GS dataset containing annotations for 10,004 genes in 858 gene sets. C6 is an Oncogenic Signature dataset containing 10,897 elements in 189 oncogenic signatures.
+
+## GSEA Pre-Processing
+
+Entrez_gene_ID was retained and added to the existing DEGs dataframe, following by NAs and duplicates removal.
+
+
+```{r}
+# Search for entrez_gene_id and add it to the DEGs dataframe
+convert <- getBM(attributes=c("ensembl_gene_id","entrezgene_id","external_gene_name"),
+                 filters=c("ensembl_gene_id"), 
+                 values=DEGs$ensembl_gene_id,
+                 mart = ensembl)
+DEGs <- merge(DEGs,convert,by.x=c("ensembl_gene_id","external_gene_name"),by.y=c("ensembl_gene_id","external_gene_name"))
+
+# Removing NAs
+DEGs <- DEGs[which(!is.na(DEGs$entrezgene_id)),]
+# Removing duplicates
+DEGs <- DEGs[-which(duplicated(DEGs$entrezgene_id)),]
+```
+
+## Ranked list 
+
+A log2FC ranked list was built, it will serve as main input for MSigDB enrichment.   
+The first and last ten entrezgene_id with their rank score are provided below.
+
+```{r,}
+# This is the ranked list
+ranks <- DEGs$logFC
+names(ranks) <- DEGs$entrezgene_id
+ranks <- sort(ranks,decreasing = T)
+```
+```{r, echo=F}
+head(ranks) # first in the rank is entrezgene_id = 158763 with a score of 9.3
+tail(ranks) # last in the rank is entrezgene_id = 55117 with a score of -4.8 
+```
+
+A barplot was generated to visualize the distribution of gene expression changes and verify the structure of the ranking.
+
+```{r, fig.align='center'}
+ranks_barplot <- ranks
+names(ranks_barplot) <- DEGs$external_gene_name
+ranks_barplot <- sort(ranks_barplot,decreasing = T)
+barplot(sort(ranks_barplot, decreasing = T),las=3, cex.names = 0.8) 
+```
+
+## GSEA on C4
+
+The R package "fgsea" was used to perform the enrichment analysis on the retrieved C4 dataset.  
+The top 10 positively (NES > 0) and negatively (NES < 0) enriched pathways were filtered and ranked by adjusted p-value, the results are shown in the tables below.
+
+Additional key plots display the most significantly enriched pathways, along with the enrichment score profiles of two representative genes from the top ten.
+
+```{r}
+# Retrieve C4 data
+MSigDB_C4 <- msigdbr(species = "Homo sapiens", category = "C4") %>%
+  split(x = .$entrez_gene, f = .$gs_name)
+
+#GSEA performed
+fgseaRes_C4 <- fgsea(pathways = MSigDB_C4,
+                  stats = ranks,
+                  minSize = 15,
+                  maxSize = 500)
+```
+
+
+## Top 10 Up-Regulated Gene Sets
+
+```{r}
+topUp_C4 <- fgseaRes_C4 %>% filter(NES > 0) %>% top_n(10, wt=-padj) %>% arrange(padj)
+as.tibble(head(topUp_C4, 10))
+```
+
+## Top 10 Down-Regulated Gene Sets
+
+```{r}
+topDown_C4 <- fgseaRes_C4 %>% filter(NES < 0) %>% top_n(10, wt=-padj) %>% arrange(padj)
+as.tibble(head(topDown_C4,10))
+```
+
+```{r}
+topPathways_C4 <- bind_rows(topUp_C4, topDown_C4) %>% arrange(padj)
+plotGseaTable(MSigDB_C4[topPathways_C4$pathway], 
+              ranks, 
+              fgseaRes_C4, 
+              gseaParam = 0.5)
+```
+
+```{r}
+plotEnrichment(MSigDB_C4[["GAVISH_3CA_MALIGNANT_METAPROGRAM_19_EPITHELIAL_SENESCENCE"]],ranks)+
+ggtitle("Enrichment Plot for GAVISH_3_CA (MSigDB C4)") +
+  xlab("Ranked Genes") +
+  ylab("Enrichment Score (ES)") +
+  theme(plot.title = element_text(size = 12, face = "bold", hjust = 0.5))
+
+plotEnrichment(MSigDB_C4[["GAVISH_3CA_METAPROGRAM_B_CELLS_STRESS"]],ranks) +
+  ggtitle("Enrichment Plot for GAVISH_3CA (MsigDB C4)") +
+  xlab("Ranked Genes") +
+  ylab("Enrichment Score (ES)") +
+  theme(plot.title = element_text(size = 12, face = "bold", hjust = 0.5))
+```
+    
+## GSEA on C6 
+
+The same workflow was applied to C6. Unfortunately only one down-regulated gene set (MTOR_UP.N4.V1_DN) was found.
+Several attempts were made to improve our results. The p-value threshold was initially relaxed from 0.05 to 0.1. Since this resulted in no significant changes, the logFC cutoff was subsequently lowered from 1.5 to 1, which led to a doubling of both up- and downregulated genes. However, no improvements were observed.
+
+```{r}
+# Retrieve C6 data
+MSigDB_C6 <- msigdbr(species = "Homo sapiens", category = "C6") %>%
+  split(x = .$entrez_gene, f = .$gs_name)
+# GSEA performed
+fgseaRes_C6 <- fgsea(pathways = MSigDB_C6,
+                  stats = ranks,
+                  minSize = 15,
+                  maxSize = 500)
+```
+
+## Top 10 Up-Regulated Gene Sets 
+
+```{r}
+topUp_C6 <- fgseaRes_C6 %>% filter(NES > 0) %>% top_n(10, wt=-padj) %>% arrange(padj)
+as.tibble(head(topUp_C6, 10))
+```
+
+## Top 10 Down-Regulated Gene Sets
+
+```{r}
+topDown_C6 <- fgseaRes_C6 %>% filter(NES < 0) %>% top_n(10, wt=-padj) %>% arrange(padj)
+as.tibble(head(topDown_C6,10))
+```
+
+```{r}
+topPathways_C6 <- bind_rows(topUp_C6, topDown_C6) %>% arrange(padj)
+plotGseaTable(MSigDB_C6[topPathways_C6$pathway], 
+              ranks, 
+              fgseaRes_C6, 
+              gseaParam = 0.5)
+```
+
+```{r}
+plotEnrichment(MSigDB_C6[["P53_DN.V1_UP"]],ranks)+
+ggtitle("Enrichment Plot for P53_DN.V1_UP (MSigDB C6)") +
+  xlab("Ranked Genes") +
+  ylab("Enrichment Score (ES)") +
+  theme(plot.title = element_text(size = 12, face = "bold", hjust = 0.5))
+
+plotEnrichment(MSigDB_C6[["MTOR_UP.N4.V1_DN"]],ranks) +
+  ggtitle("Enrichment Plot for MTOR_UP.N4.V1_DN (MsigDB C6)") +
+  xlab("Ranked Genes") +
+  ylab("Enrichment Score (ES)") +
+  theme(plot.title = element_text(size = 12, face = "bold", hjust = 0.5))
+```
+    
+# Motif Enrichment Analysis
+
+Motif enrichment was conducted to identify transcription factors (TFs) whose binding motifs are significantly overrepresented in the promoter regions (500bp upstream of the transcription starting site) of top up- and down-regulated genes from the MSigDB C4 gene set collection.
+
+```{r}
+#Extract all genes contributing to enrichment signals for top up-/down-regulated gene sets
+genes_for_up_analysis <- topUp_C4 %>%
+  pull(leadingEdge) %>% unlist() %>% unique()
+
+genes_for_down_analysis <- topDown_C4 %>%
+  pull(leadingEdge) %>% unlist() %>% unique()
+
+#Load all known gene coordinates from the UCSC hg38 transcript database
+genes_hg38 <- genes(TxDb.Hsapiens.UCSC.hg38.knownGene)
+
+#Filter UCSC gene annotation to include only the genes from our ranked list (based on Entrez ID)
+up_genes_gr <- genes_hg38[genes_hg38$gene_id %in% genes_for_up_analysis]
+sprintf("N° of Up-regulated gene sets: %s", length(up_genes_gr))
+
+down_genes_gr <- genes_hg38[genes_hg38$gene_id %in% genes_for_down_analysis]
+sprintf("N° of Down-regulated gene sets: %s", length(down_genes_gr))
+#Define the promoter region as 500 bp upstream of the trascription starting site for each gene
+up_promoters <- promoters(up_genes_gr, upstream = 500, downstream = 0)
+down_promoters <- promoters(down_genes_gr, upstream = 500, downstream = 0)
+
+#Fetch actual DNA sequences from the hg38 genome for each defined promoter region
+up_promoters_seqs <- getSeq(BSgenome.Hsapiens.UCSC.hg38, up_promoters)
+down_promoters_seqs <- getSeq(BSgenome.Hsapiens.UCSC.hg38, down_promoters)
+```
+
+Position weight matrices (PWMs) representing TF binding motifs for human are loaded, and subsequently, motif enrichment for up- and down-regulated genes is performed using binding affinity scoring.
+The top 10 enriched TF motifs for each analysis displaying logos, enrichment scores and p-values are plotted, ranked by p-value. 
+
+```{r}
+#biomaRt used to map Entrez gene IDs to gene symbols
+df_up <- biomaRt::getBM(
+  attributes = c("external_gene_name", 'entrezgene_id'),
+  values = names(up_promoters_seqs), filters = 'entrezgene_id', mart = useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+)
+#match for up
+names(up_promoters_seqs) <- df_up$external_gene_name[match(names(up_promoters_seqs), df_up$entrezgene_id)]
+
+df_down <- biomaRt::getBM(
+  attributes = c("external_gene_name", 'entrezgene_id'),
+  values = names(down_promoters_seqs), filters = 'entrezgene_id', mart = useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+)
+#match for down
+names(down_promoters_seqs) <- df_down$external_gene_name[match(names(down_promoters_seqs), df_down$entrezgene_id)]
+
+#Filter out sequences where gene name mapping failed (although there were none in this case)
+up_promoters_seqs <- up_promoters_seqs[!is.na(names(up_promoters_seqs))]
+down_promoters_seqs <- down_promoters_seqs[!is.na(names(down_promoters_seqs))]
+
+data(PWMLogn.hg19.MotifDb.Hsap)
+```
+
+## Top 10 TFs of Up-Regulated DEGs
+
+```{r}
+sequences_up <- lapply(up_promoters_seqs,function(x) DNAString(x))
+enriched_TFs <- motifEnrichment(sequences_up,PWMLogn.hg19.MotifDb.Hsap,score = "affinity")
+report_up = groupReport(enriched_TFs)
+plot(report_up[1:10], fontsize=7, id.fontsize=10) #plot top 10 motifs
+```
+
+## Top 10 TFs of Down-Regulated DEGs
+
+```{r}
+sequences_down <- lapply(down_promoters_seqs,function(x) DNAString(x))
+enriched_TFs <- motifEnrichment(sequences_down,PWMLogn.hg19.MotifDb.Hsap,score = "affinity")
+report_down = groupReport(enriched_TFs)#ordered by p-value
+plot(report_down[1:10], fontsize=7, id.fontsize=10)
+```
+
+## SP1 TF Analysis
+
+Among the most enriched TFs, we computed the empirical distributions of scores for all PWMs found in MotifDB for SP1. Literature reports that its expression in nuclear extracts from thyroid tumors was significantly higher than that observed in corresponding normal tissues [4].   
+The log2 distribution with a threshold cutoff of 99.75% is provided below.
+
+```{r}
+#Select all motif entries in MotifDb associated with the transcription factor SP1
+tf <- "SP1"
+motifs_tf <- subset(MotifDb, organism == "Hsapiens" & geneSymbol == tf)
+
+#Convert motif object to PWM format
+PWM_list <- toPWM(as.list(motifs_tf))
+#Generate an empirical cumulative distribution function (ECDF) for scores, simulating a null distribution across the genome
+ecdf_list <- motifEcdf(PWM_list, organism = "hg19", quick = TRUE)
+
+#Compute the 99.75% quantile threshold for each motif score distribution
+cutoff99_75 <- lapply(ecdf_list, function(ecdf) {
+  quantile(ecdf, probs = 0.9975)
+})
+#Apply log2 transformation to match interpretation conventions for TF binding strength
+cutoff99_75_log2 <- lapply(cutoff99_75, log2) 
+
+#Print the motif names and their corresponding log2-transformed 99.75% cutoff scores, used to determine strong motif matches in future analyses
+for (i in seq_along(cutoff99_75_log2)) {
+  cat("Motif:", names(cutoff99_75_log2)[i], 
+      "\tCutoff (log2) @ 99.75%:", round(cutoff99_75_log2[[i]], 3), "\n")
+}
+```
+
+# Network analysis
+## Protein-Protein-Interaction (PPI) 
+
+STRING database was used to find PPI interactions among the differentially expressed genes. The obtained network was exported in tsv format.   
+
+From the interaction data, an undirected graph was constructed, with each node being a gene and each edge a protein-protein interaction.
+
+```{r, results='hide'}
+#Save the full list of differentially expressed genes (both up- and down-regulated) to a .txt file for use in the STRING database
+write.table(DEGs, "DEGs.txt", sep = "\t", quote = FALSE, row.names = FALSE)
+
+#Import the PPI network data retrieved from the STRING database
+links <- read.delim("string_interactions_short.tsv",  header = TRUE, stringsAsFactors = FALSE)
+
+## Create the network
+net <- graph_from_data_frame(d=links, directed=FALSE) 
+deg <- degree(net,mode="all") #Calculate degree for each node
+sort(deg,decreasing = T) #Sort nodes by degree
+```
+
+## Degree Distribution
+
+For each node, the degree was computed and an histogram was plotted to show how many nodes have a certain number of connections, which is useful to spot hubs. 
+The complement of the cumulative degree distribution was also plotted, and it helps visualize how rare or common highly connected nodes are.
+
+```{r}
+# Plot the histogram
+hist(deg,
+     breaks = 30,
+     col = "orange",
+     main = "Nodes degree distribution",
+     xlab = "Degree")
+```
+
+```{r}
+#Degree distribution (cumulative distribution)
+deg.dist <- degree_distribution(net, cumulative=T, mode="all")
+plot(x=0:max(deg), y=1-deg.dist, pch=19, cex=1.2, col="orange", xlab="Degree", ylab="Cumulative Frequency")
+```
+
+## Centrality measures
+
+The key centrality measures are computed: degree (number of direct connections), closeness (how close a node is to others in the network), betweenness (how often a node sits on shortest paths between other nodes).
+For each centrality measure, the top 10 genes are extracted. Among these, COL1A1 and COL1A2 stood out as particularly relevant. Previous studies using weighted gene co-expression network analysis have identified these collagen-encoding genes as central hub genes associated with papillary thyroid carcinoma progression [7], and their aberrant expression has been documented as well in the disease [8].
+
+```{r}
+# Centrality indexes
+deg_score <- degree(net) #normalized degree
+clo_score <- closeness(net, mode="all", normalized=TRUE) 
+bet_score <- betweenness(net, normalized=TRUE)
+
+top10_degree <- sort(deg_score, decreasing=TRUE)[1:10]
+top10_closeness <- sort(clo_score, decreasing=TRUE)[1:10]
+top10_betweenness <- sort(bet_score, decreasing=TRUE)[1:10] 
+
+#Top 10 genes for degree centrality
+top10_degree
+```
+
+```{r}
+#Top 10 genes for closeness centrality
+top10_closeness
+```
+
+```{r}
+#Top 10 genes for betweenness centrality
+top10_betweenness
+```
+
+The gene with the highest degree and betweenness  centrality scores was FN1, which studies identified to be one of 5 hub genes involved in the onset and progression of thyroid cancer. It is also demonstrated that higher FN1 gene expression levels were strongly associated with a higher pathologic stage and tumor stage, and were significantly associated with immune cell infiltration in thyroid cancer [5,6].
+
+## Largest Connected Component
+
+We first identified the connected components of the graph (i.e., subgraphs in which every node is reachable from any other node), then extracted the largest connected component (LCC). Community detection was performed on the LCC using fast greedy clustering to reveal its modular structure. Finally, the LCC was visualized.
+
+```{r}
+# Extract LCC
+set.seed(1) # For reproducibility
+c <- components(net)
+lcc <- induced_subgraph(net, which(c$membership == which.max(c$csize)))
+communities <- cluster_fast_greedy(lcc)
+
+#Plot LCC
+plot(lcc,
+     vertex.color="orange",
+     vertex.size=5,
+     vertex.label = NA,
+     vertex.frame.color="darkgray",
+     main = "LCC")
+
+```
+
+```{r}
+cat("\n LCC:\n",
+    "Nodes number:", vcount(lcc), "\n",
+    "Edges number:", ecount(lcc), "\n",
+    "Average path length in LCC:", mean_distance(lcc, directed = FALSE), "\n",
+    "Diameter of LCC:", diameter(lcc, directed = FALSE), "\n",
+    "Average clustering coefficient of LCC:", transitivity(lcc, type = "average"), "\n",
+    "Number of communities detected:", length(communities), "\n")
+```
+
+Community detection reveals 19 clusters within the LCC. These clusters potentially represent groups of genes with shared biological functions or pathways. However, due to the high number of communities and network density, the structure appears visually crowded, making interpretation difficult.   
+
+```{r}
+set.seed(1)
+n_comm <- length(unique(membership(communities)))
+col_vec <- rainbow(n_comm)
+plot(communities, lcc,
+     layout = layout_with_fr,
+     main = "Community Structure in LCC",
+     mark.col = alpha(col_vec, 0.2),    
+     mark.border = alpha(col_vec, 0.8),   
+     col = col_vec[membership(communities)],
+     vertex.label = NA,
+     vertex.size = 3,                      
+     vertex.frame.color = alpha("gray40", 0.5), 
+     edge.width = 0.3,                     
+     edge.color = alpha("gray30", 0.15) 
+)
+```
+
+To simplify the network and focus on key players, we filtered out low-degree nodes (degree < 10). The resulting LCC contains 218 nodes and 1825 edges. This reduced network highlights more interconnected genes, improving clarity and interpretability.     
+ 
+The filtered LCC shows a higher clustering coefficient (~0.49), shorter average path length (~2.39), and smaller diameter (5), indicating a tighter and more cohesive network. Only 4 distinct communities were identified, making the modular structure easier to analyze.     
+
+Community detection in the filtered network reveals 4 clearly separated clusters. These may correspond to core biological processes or tightly co-regulated gene groups, making them prime candidates for further functional enrichment or pathway analysis.
+
+```{r}
+#Filter by degree 
+filtered_nodes <- V(net)[deg >= 10]
+filtered_net <- induced_subgraph(net, filtered_nodes)
+c_filt <- components(filtered_net)
+filtered_net <- induced_subgraph(filtered_net, which(c_filt$membership == which.max(c_filt$csize)))
+
+communities_filtered <- cluster_fast_greedy(filtered_net)
+
+# Plot
+plot(filtered_net,
+     vertex.color="orange",
+     vertex.size=5,
+     vertex.label = NA,
+     vertex.frame.color="darkgray",
+     main = "LCC of filtered net")
+
+```
+
+
+```{r}
+cat("\n LCC:\n",
+    "Nodes number:", vcount(filtered_net), "\n",
+    "Edges number:", ecount(filtered_net), "\n",
+    "Average path length in LCC:", mean_distance(filtered_net, directed = FALSE), "\n",
+    "Diameter of LCC:", diameter(filtered_net, directed = FALSE), "\n",
+    "Average clustering coefficient of LCC:", transitivity(filtered_net, type = "average"), "\n",
+    "Number of communities detected:", length(communities_filtered), "\n")
+```
+
+
+```{r}
+# Filtered Community
+set.seed(1)
+n_comm_filt <- length(unique(membership(communities_filtered)))
+colors <- rainbow(n_comm_filt)
+plot(communities_filtered, filtered_net,
+     layout = layout_with_fr,
+     main = "Filtered Community Structure in LCC",
+     mark.col = alpha(colors, 0.2),    
+     mark.border = alpha(colors, 0.8),   
+     col = colors[membership(communities_filtered)],
+     vertex.label = NA,
+     vertex.size = 3,                      
+     vertex.frame.color = alpha("gray40", 0.5), 
+     edge.width = 0.3,                     
+     edge.color = alpha("gray30", 0.15) 
+)
+```
+
+
+
+## EnrichMaps Of Communities
+
+An enrichment map was generated for each of the identified gene communities, using annotation terms derived from Gene Ontology (GO) Biological Processes (BP). The analysis revealed distinct functional signatures for each community.   
+Community 1 was primarily enriched in terms related to the immune response, including B cell activation, differentiation, and proliferation. Community 2 showed strong enrichment for processes associated with nervous system development and function, while community 3 was characterized by enrichment in developmental pathways, tissue morphogenesis, and extracellular matrix (ECM) organization, with a particular emphasis on ECM remodeling and structural integrity. Finally, community 4 was enriched in pathways related to host-pathogen interactions, blood coagulation, wound healing, and broader immune processes.
+
+```{r, fig.align='center'}
+# Retain from go
+genes1 <- communities_filtered[[1]]
+enrich_results1 <- enrichGO(
+    gene = genes1,
+    OrgDb = org.Hs.eg.db,
+    keyType = "SYMBOL",         
+    ont = "BP",                 
+    pvalueCutoff = 0.05,
+    readable = TRUE
+)
+# Plot the enrichmap 
+emapplot(pairwise_termsim(enrich_results1), showCategory = 20) + 
+ggtitle("GO BP Enrichment for Community 1")
+```
+
+
+```{r}
+genes2 <- communities_filtered[[2]]
+enrich_results2 <- enrichGO(
+    gene = genes2,
+    OrgDb = org.Hs.eg.db,
+    keyType = "SYMBOL",         
+    ont = "BP",                 
+    pvalueCutoff = 0.05,
+    readable = TRUE
+)
+emapplot(pairwise_termsim(enrich_results2), showCategory = 17)  + 
+ggtitle("GO BP Enrichment for Community 2")
+```
+
+
+```{r}
+genes3 <- communities_filtered[[3]]
+enrich_results3 <- enrichGO(
+    gene = genes3,
+    OrgDb = org.Hs.eg.db,
+    keyType = "SYMBOL",         
+    ont = "BP",                 
+    pvalueCutoff = 0.05,
+    readable = TRUE
+)
+emapplot(pairwise_termsim(enrich_results3), showCategory = 20) + 
+ggtitle("GO BP Enrichment for Community 3")
+```
+```{r}
+genes4 <- communities_filtered[[4]]
+enrich_results4 <- enrichGO(
+    gene = genes4,
+    OrgDb = org.Hs.eg.db,
+    keyType = "SYMBOL",         
+    ont = "BP",                 
+    pvalueCutoff = 0.05,
+    readable = TRUE
+)
+emapplot(pairwise_termsim(enrich_results4), showCategory = 18)   + 
+ggtitle("GO BP Enrichment for Community 4")
+```
+    
+  
+# Conclusions
+
+In this study, we carried out a multi-step analysis using RNA-seq data to investigate transcriptional differences and molecular mechanisms potentially involved in thyroid carcinoma.   
+During preprocessing, unsupervised exploratory analyses showed an almost distinct separation between case and control groups, suggesting reliable and biologically meaningful data.    
+We then performed gene set enrichment analysis (GSEA) to assess broader pathway-level changes across the transcriptome. Motif enrichment analysis of the differentially expressed genes highlighted several transcription factors, including SP1, which is known to play a role in the development and progression of thyroid carcinoma. Finally, network analysis using STRING-derived protein–protein interactions allowed us to visualize the connectivity of DEGs and uncover topological features such as hub genes and community structures. The identified communities corresponded to key biological processes including immune response, nervous system development, tissue morphogenesis and extracellular matrix organization, as well as host-pathogen interactions and wound healing. Key hub genes identified, FN1, COL1A1, and COL1A2, are involved in extracellular matrix organization and have been linked to thyroid cancer progression, reinforcing their potential relevance as biomarkers or therapeutic targets.
+     
+# References
+
+1. Deng Y, Li H, Wang M, Li N, Tian T, Wu Y, Xu P, Yang S, Zhai Z, Zhou L, Hao Q, Song D, Jin T, Lyu J, Dai Z. Global Burden of Thyroid Cancer From 1990 to 2017. JAMA Netw Open. 2020 Jun 1;3(6):e208759. doi: 10.1001/jamanetworkopen.2020.8759. PMID: 32589231; PMCID: PMC7320301.
+    
+2. Hu J, Yuan IJ, Mirshahidi S, Simental A, Lee SC, Yuan X. Thyroid Carcinoma: Phenotypic Features, Underlying Biology and Potential Relevance for Targeting Therapy. Int J Mol Sci. 2021 Feb 16;22(4):1950. doi: 10.3390/ijms22041950. PMID: 33669363; PMCID: PMC7920269.      
+3. Siegel RL, Miller KD, Fuchs HE, Jemal A. Cancer statistics, 2022. CA Cancer J Clin. 2022 Jan;72(1):7-33. doi: 10.3322/caac.21708. Epub 2022 Jan 12. PMID: 35020204.     
+4. Chiefari E, Brunetti A, Arturi F, Bidart JM, Russo D, Schlumberger M, Filetti S. Increased expression of AP2 and Sp1 transcription factors in human thyroid tumors: a role in NIS expression regulation? BMC Cancer. 2002 Dec 10;2:35. doi: 10.1186/1471-2407-2-35. Epub 2002 Dec 10. PMID: 12475396; PMCID: PMC139985.
+      
+5. Pan H, Luo Z, Lin F, Zhang J, Xiong T, Hong Y, Sun B, Yang Y. FN1, a reliable prognostic biomarker for thyroid cancer, is associated with tumor immunity and an unfavorable prognosis. Oncol Lett. 2024 Aug 26;28(5):510. doi: 10.3892/ol.2024.14643. PMID: 39268167; PMCID: PMC11391506.
+       
+6. Liu, M., Chen, P., Wei, B. et al. FN1 shapes the behavior of papillary thyroid carcinoma through alternative splicing of EDB region. Sci Rep 15, 327 (2025). doi:10.1038/s41598-024-83369-5
+      
+7. Tang X, Huang X, Wang D, Yan R, Lu F, Cheng C, Li Y, Xu J. Identifying gene modules of thyroid cancer associated with pathological stage by weighted gene co-expression network analysis. Gene. 2019 Jul 1;704:142-148. doi: 10.1016/j.gene.2019.04.017. Epub 2019 Apr 6. PMID: 30965127.
+       
+8. Di Maro, G., Orlandella, F. M., Bencivenga, T. C., Salerno, P., Ugolini, C., Basolo, F., ... & Salvatore, G. (2014). Identification of targets of Twist1 transcription factor in thyroid cancer cells. The Journal of Clinical Endocrinology & Metabolism, 99(9), E1617-E1626.
